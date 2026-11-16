@@ -1,0 +1,681 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "io/console"
+require "time"
+require "uri"
+require "fileutils"
+require "shellwords"
+require "timeout"
+
+module HerdrSlackInbox
+  DEFAULT_INTERVAL = 180
+  READ_TOOLS = %w[slack_read_user_profile slack_search_public_and_private slack_read_thread slack_read_channel].freeze
+
+  class Error < StandardError; end
+  class AuthError < Error; end
+  class ParseError < Error; end
+
+  class AppServer
+    attr_reader :calls
+
+    def initialize(command: ENV.fetch("HERDR_SLACK_INBOX_CODEX", "codex"))
+      @command = Shellwords.split(command)
+      @mutex = Mutex.new
+      @calls = []
+      @serial = 0
+    end
+
+    def tool(name, arguments = {})
+      raise Error, "Tool is not allowed: #{name}" unless READ_TOOLS.include?(name)
+
+      @mutex.synchronize do
+        @calls << name
+        twice do
+          start unless @thread_id
+          result = request("mcpServer/tool/call", {threadId: @thread_id, server: "codex_apps", tool: "slack.#{name}", arguments: arguments})
+          if result["isError"]
+            message = result.dig("structuredContent", "error_code") || result.dig("content", 0, "text") || "Slack tool failed"
+            raise classify(message)
+          end
+          result
+        end
+      end
+    end
+
+    def rate_limits
+      @mutex.synchronize { twice { start unless @thread_id; request("account/rateLimits/read", nil) } }
+    end
+
+    def close
+      @mutex.synchronize { stop }
+    end
+
+    private
+
+    def classify(message)
+      text = message.to_s
+      text.match?(/auth|login|connect|install|token|permission|not.connected|unauthorized|401|403/i) ? AuthError.new(text) : Error.new(text)
+    end
+
+    def twice
+      attempts = 0
+      begin
+        yield
+      rescue EOFError, Errno::EPIPE, IOError, Timeout::Error
+        attempts += 1
+        stop
+        retry if attempts < 2
+        raise Error, "Codex app-server stopped responding"
+      end
+    end
+
+    def start
+      parent_read, child_write = IO.pipe
+      child_read, parent_write = IO.pipe
+      @pid = Process.spawn(*(@command + ["app-server"]), in: child_read, out: child_write, err: File::NULL)
+      child_read.close
+      child_write.close
+      @stdin = parent_write
+      @stdout = parent_read
+      request("initialize", {clientInfo: {name: "herdr-slack-inbox", version: "0.1"}})
+      @stdin.puts(JSON.generate({method: "initialized"}))
+      @stdin.flush
+      @thread_id = request("thread/start", {ephemeral: true, cwd: Dir.pwd}).dig("thread", "id")
+      raise Error, "Codex app-server did not return a thread ID" unless @thread_id
+    rescue Errno::ENOENT
+      raise Error, "codex command not found"
+    end
+
+    def stop
+      @thread_id = nil
+      @stdin.close if @stdin && !@stdin.closed?
+      @stdout.close if @stdout && !@stdout.closed?
+      if @pid
+        Process.kill("TERM", @pid) rescue nil
+        Process.waitpid(@pid) rescue nil
+      end
+      @pid = nil
+      @stdin = nil
+      @stdout = nil
+    end
+
+    def request(method, params)
+      @serial += 1
+      id = @serial
+      @stdin.puts(JSON.generate({id: id, method: method, params: params}))
+      @stdin.flush
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 45
+      loop do
+        left = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        raise Timeout::Error if left <= 0
+        raise Timeout::Error unless IO.select([@stdout], nil, nil, left)
+        line = @stdout.gets
+        raise EOFError unless line
+        message = JSON.parse(line)
+        next unless message["id"] == id
+        raise classify(message["error"].to_s) if message["error"]
+        return message.fetch("result")
+      end
+    rescue JSON::ParserError => e
+      raise Error, "Invalid Codex response: #{e.message}"
+    end
+  end
+
+  module Parse
+    module_function
+
+    def text(result)
+      raw = result.fetch("content", []).filter_map { |part| part["text"] if part["type"] == "text" }.join("\n")
+      raise ParseError, "Empty Slack response" if raw.empty?
+      parsed = JSON.parse(raw)
+      parsed.is_a?(Hash) ? parsed : {"result" => raw}
+    rescue JSON::ParserError
+      {"result" => raw}
+    end
+
+    def profile(result)
+      body = text(result).fetch("result", "")
+      id = body[/^User ID:\s*(U[A-Z0-9]+)\s*$/i, 1]
+      raise ParseError, "Could not read Slack user ID" unless id
+      id
+    end
+
+    def search(result, kind:)
+      payload = text(result)
+      body = payload["results"] || payload["result"] || ""
+      raise ParseError, "Could not read Slack search results" unless body.include?("Search Results")
+      cursor = payload["pagination_info"].to_s[/cursor `([^`]+)`/, 1]
+      chunks = body.split(/^###\s+Result\s+\d+\s+of\s+\d+\s*$/i).drop(1)
+      if chunks.empty? && body.match?(/\b[1-9]\d* results?\b/i)
+        raise ParseError, "Could not parse Slack search entries"
+      end
+      items = chunks.filter_map do |chunk|
+        fields = {}
+        chunk.lines.each do |raw_line|
+          line = raw_line.chomp
+          match = line.match(/\A(Channel|Participants|From|Time|Message_ts|Permalink|Text):\s*(.*)\z/)
+          fields[match[1]] = match[2].strip if match
+        end
+        channel = fields["Channel"]&.match(/\bID:\s*([CDG][A-Z0-9]+)/i)&.[](1)
+        ts = fields["Message_ts"]&.match(/\b(\d+\.\d+)\b/)&.[](1)
+        next unless channel && ts
+        text_body = chunk[/^Text:\s*\n(.*?)(?:\n---\s*\z|\z)/m, 1].to_s.strip
+        url = fields["Permalink"].to_s[/\]\((https:\/\/[^)]+)\)/, 1] || fields["Permalink"].to_s[/https:\/\/\S+/, 0]
+        sender = fields["From"].to_s.sub(/\s*\(ID:\s*U[A-Z0-9]+\).*\z/i, "")
+        sender_id = fields["From"].to_s[/\bID:\s*(U[A-Z0-9]+)/i, 1]
+        label = fields["Channel"].to_s.sub(/\s*\(ID:\s*[CDG][A-Z0-9]+\).*\z/i, "")
+        label = fields["Participants"].to_s.split(",").first.sub(/\s*\(ID:\s*U[A-Z0-9]+\).*\z/i, "") if kind == "dm" && fields["Participants"]
+        {"id" => "#{channel}:#{ts}", "kind" => kind, "channel_id" => channel, "channel" => label, "sender" => sender, "sender_id" => sender_id, "ts" => ts, "time" => fields["Time"], "text" => text_body, "permalink" => url}
+      end
+      raise ParseError, "Could not parse #{chunks.length - items.length} Slack search entries" if items.length != chunks.length
+      [items, cursor]
+    end
+
+    def detail(result)
+      payload = text(result)
+      body = payload["result"] || payload["messages"] || payload.values.find { |value| value.is_a?(String) } || ""
+      body.to_s
+    end
+  end
+
+  class Seen
+    def initialize(path: File.join(ENV.fetch("XDG_STATE_HOME", File.join(Dir.home, ".local", "state")), "herdr-slack-inbox", "seen.json"))
+      @path = path
+      @ids = File.file?(path) ? JSON.parse(File.read(path)) : []
+      raise Error, "Invalid seen file" unless @ids.is_a?(Array)
+    rescue JSON::ParserError => e
+      raise Error, "Invalid seen file: #{e.message}"
+    end
+
+    def include?(id)
+      @ids.include?(id)
+    end
+
+    def add(id)
+      return if include?(id)
+      @ids << id
+      FileUtils.mkdir_p(File.dirname(@path))
+      temporary = "#{@path}.tmp.#{Process.pid}"
+      File.write(temporary, JSON.generate(@ids))
+      File.rename(temporary, @path)
+    ensure
+      File.delete(temporary) if temporary && File.exist?(temporary)
+    end
+  end
+
+  class Exclusions
+    def initialize(path: File.join(ENV.fetch("XDG_CONFIG_HOME", File.join(Dir.home, ".config")), "herdr-slack-inbox", "excluded.json"))
+      @path = path
+      @channels = File.file?(path) ? JSON.parse(File.read(path)) : {}
+      raise Error, "Invalid exclusions file" unless @channels.is_a?(Hash) && @channels.all? { |id, label| id.match?(/\A[CDG][A-Z0-9]+\z/) && label.is_a?(String) }
+    rescue JSON::ParserError => e
+      raise Error, "Invalid exclusions file: #{e.message}"
+    end
+
+    def include?(channel_id)
+      @channels.key?(channel_id)
+    end
+
+    def channels
+      @channels.to_a.sort_by { |_id, label| label.downcase }
+    end
+
+    def add(channel_id, label)
+      raise Error, "Invalid channel ID" unless channel_id.match?(/\A[CDG][A-Z0-9]+\z/)
+      @channels[channel_id] = label.to_s
+      save
+    end
+
+    def remove(channel_id)
+      return unless @channels.delete(channel_id)
+      save
+    end
+
+    private
+
+    def save
+      FileUtils.mkdir_p(File.dirname(@path))
+      temporary = "#{@path}.tmp.#{Process.pid}"
+      File.write(temporary, JSON.generate(@channels))
+      File.rename(temporary, @path)
+    ensure
+      File.delete(temporary) if temporary && File.exist?(temporary)
+    end
+  end
+
+  class Inbox
+    attr_reader :items, :interval, :last_checked_at, :warning, :excluded_count
+
+    def initialize(app:, seen:, exclusions: Exclusions.new, output: $stdout, osc: true, interval: DEFAULT_INTERVAL, days: 3)
+      @app = app
+      @seen = seen
+      @exclusions = exclusions
+      @output = output
+      @osc = osc
+      @interval = interval
+      @days = days
+      @items = []
+      @all_items = []
+      @excluded_count = 0
+      @items_mutex = Mutex.new
+      @cache = {}
+      @state = nil
+      @warning = nil
+      @since = (Time.now - days * 86_400).to_i
+      @sources = {"mention" => {after: @since, cursor: nil, pending: []}, "dm" => {after: @since, cursor: nil, pending: []}}
+    end
+
+    def fetch
+      @uid ||= Parse.profile(@app.tool("slack_read_user_profile", {}))
+      all = []
+      @sources.each do |kind, source|
+        args = {filters: kind == "dm" ? "is:dm" : "<@#{@uid}>", keywords: [], natural_language_query: "", after: source[:after].to_s, sort: "timestamp", sort_dir: "desc", limit: 20, response_format: "detailed", include_context: false, content_types: "messages"}
+        args[:cursor] = source[:cursor] if source[:cursor]
+        search_result = Parse.search(@app.tool("slack_search_public_and_private", args), kind: kind)
+        page = search_result[0]
+        cursor = search_result[1]
+        source[:pending].concat(page)
+        all.concat(page)
+        source[:cursor] = cursor
+        unless cursor
+          newest = source[:pending].map { |item| item["ts"].to_i }.max
+          source[:after] = [source[:after], newest.to_i].max
+          source[:pending] = []
+        end
+      end
+      @warning = @sources.any? { |_kind, source| source[:cursor] } ? "More results are loading" : nil
+      @items_mutex.synchronize do
+        merged = (@all_items + all).to_h { |item| [item["id"], item] }
+        all.each { |item| merged[item["id"]] = item if item["kind"] == "dm" }
+        @all_items = merged.values.reject { |item| @seen.include?(item["id"]) || item["sender_id"] == @uid }
+        rebuild_items
+      end
+      @last_checked_at = Time.now
+      report_state(@items.empty? ? "idle" : "blocked:kind=question")
+      true
+    rescue AuthError
+      report_state("blocked:kind=auth")
+      raise
+    rescue StandardError
+      report_state("error")
+      raise
+    end
+
+    def mark(item)
+      @items_mutex.synchronize do
+        @seen.add(item.fetch("id"))
+        @all_items.delete_if { |entry| entry["id"] == item["id"] }
+        rebuild_items
+      end
+      report_state(@items.empty? ? "idle" : "blocked:kind=question")
+    end
+
+    def excluded_channels
+      @exclusions.channels
+    end
+
+    def exclude(item)
+      @items_mutex.synchronize do
+        @exclusions.add(item.fetch("channel_id"), item.fetch("channel"))
+        rebuild_items
+      end
+      report_state(@items.empty? ? "idle" : "blocked:kind=question")
+    end
+
+    def include_channel(channel_id)
+      @items_mutex.synchronize do
+        @exclusions.remove(channel_id)
+        rebuild_items
+      end
+      report_state(@items.empty? ? "idle" : "blocked:kind=question")
+    end
+
+    def detail(item)
+      @cache[item["id"]] ||= begin
+        raw = @app.tool("slack_read_thread", {channel_id: item["channel_id"], message_ts: item["ts"], response_format: "concise"})
+        Parse.detail(raw)
+      end
+    end
+
+    def cached_detail(item)
+      @cache[item["id"]]
+    end
+
+    def open(item)
+      url = item["permalink"]
+      raise Error, "This message has no permalink" unless url && URI(url).scheme == "https"
+      uri = URI(url)
+      raise Error, "Unexpected Slack permalink" unless uri.host == "slack.com" || uri.host&.end_with?(".slack.com")
+      # Chosen by OS, not by what is on PATH: on Debian and Ubuntu `open` can be openvt
+      opener = ENV["HERDR_SLACK_INBOX_OPEN"] || (RUBY_PLATFORM.include?("darwin") ? "open" : "xdg-open")
+      pid = Process.spawn(opener, url, out: File::NULL, err: File::NULL)
+      Process.detach(pid)
+    rescue Errno::ENOENT
+      raise Error, "No program to open links: #{opener} not found (set HERDR_SLACK_INBOX_OPEN)"
+    end
+
+    def report_state(state)
+      return if @state == state
+      @state = state
+      @output.write("\e]7501;state=#{state}\e\\") if @osc
+      @output.flush
+    end
+
+    private
+
+    def rebuild_items
+      @excluded_count = @all_items.count { |item| @exclusions.include?(item["channel_id"]) }
+      @items = @all_items.reject { |item| @exclusions.include?(item["channel_id"]) }.sort_by { |item| [item["kind"] == "dm" ? 0 : 1, -item["ts"].to_f] }
+    end
+  end
+
+  module Display
+    module_function
+
+    def clean(value)
+      value.to_s.gsub(/\e\[[0-9;]*[[:alpha:]]/, "").gsub(/[\x00-\x08\x0b-\x1f\x7f]/, " ").gsub(/\s+/, " ").strip
+    end
+
+    def width(char)
+      cp = char.ord
+      return 0 if (0x300..0x36f).cover?(cp) || (0xfe00..0xfe0f).cover?(cp) || cp == 0x200d
+      return 2 if (0x1100..0x115f).cover?(cp) || (0x2e80..0xa4cf).cover?(cp) || (0xac00..0xd7a3).cover?(cp) || (0xf900..0xfaff).cover?(cp) || (0xff01..0xff60).cover?(cp) || (0x1f300..0x1faff).cover?(cp) || (0x20000..0x3fffd).cover?(cp)
+      1
+    end
+
+    def clip(value, size)
+      return "" if size <= 0
+      result = +""
+      used = 0
+      clean(value).each_char do |char|
+        break if used + width(char) > size
+        result << char
+        used += width(char)
+      end
+      result + " " * (size - used)
+    end
+
+    def wrap(value, size)
+      return [] if size <= 0
+      value.to_s.split("\n", -1).flat_map do |line|
+        chars = clean(line).each_char
+        rows = [+""]
+        used = 0
+        chars.each do |char|
+          w = width(char)
+          if used + w > size
+            rows << +""
+            used = 0
+          end
+          rows[-1] << char
+          used += w
+        end
+        rows
+      end
+    end
+
+    def age(ts)
+      seconds = [Time.now.to_i - ts.to_i, 0].max
+      return "#{seconds / 60}m" if seconds < 3600
+      return "#{seconds / 3600}h" if seconds < 86_400
+      return "#{seconds / 86_400}d" if seconds < 604_800
+      "#{seconds / 604_800}w"
+    end
+
+    def line(item)
+      "#{clip(item['kind'] == 'dm' ? 'DM' : '@', 2)} #{clip(item['channel'], 24)} #{clip(item['sender'], 18)} #{clip(age(item['ts']), 5)} #{clean(item['text'])}"
+    end
+  end
+
+  class Tui
+    def initialize(inbox, input: $stdin, output: $stdout)
+      @inbox = inbox
+      @input = input
+      @output = output
+      @selected = 0
+      @resume_index = 0
+      @message = ""
+      @detail_thread = nil
+      @detail_item = nil
+      @detail_error = nil
+      @fetch_thread = nil
+      @excluded_mode = false
+      @excluded_selected = 0
+    end
+
+    def run
+      refresh_async
+      next_fetch = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @inbox.interval
+      @input.raw do
+        @output.write("\e[?1049h\e[?25l")
+        begin
+          loop do
+            finish_jobs
+            @next_fetch = next_fetch
+            draw
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            ready = IO.select([@input], nil, nil, [1, [next_fetch - now, 0].max].min)
+            if ready
+              key = @input.getc
+              break if key.nil? || key == "q"
+              next_fetch = handle(key, next_fetch)
+            elsif now >= next_fetch
+              refresh_async
+              next_fetch = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @inbox.interval
+            end
+          end
+        ensure
+          @output.write("\e[?25h\e[?1049l")
+          @output.flush
+        end
+      end
+    end
+
+    private
+
+    def selected_item
+      return nil if @excluded_mode
+      @selected && @inbox.items[@selected]
+    end
+
+    def refresh_async
+      return if @fetch_thread&.alive?
+      @fetch_thread = Thread.new do
+        begin
+          @inbox.fetch
+          nil
+        rescue StandardError => e
+          e
+        end
+      end
+    end
+
+    def finish_jobs
+      if @fetch_thread && !@fetch_thread.alive?
+        error = @fetch_thread.value
+        @fetch_thread = nil
+        @message = error.is_a?(AuthError) ? "Connect Slack in codex /plugins: #{error.message}" : "Error: #{error.message}" if error
+        @selected = [@selected || 0, [@inbox.items.length - 1, 0].max].min
+        start_detail unless error
+      end
+      if @detail_thread && !@detail_thread.alive?
+        error = @detail_thread.value
+        @detail_error = error if selected_item && selected_item["id"] == @detail_item["id"]
+        @detail_thread = @detail_item = nil
+        start_detail unless error
+      end
+    end
+
+    def start_detail
+      item = selected_item
+      return unless item && !@inbox.cached_detail(item) && !@detail_thread
+      @detail_item = item
+      @detail_error = nil
+      @detail_thread = Thread.new do
+        begin
+          @inbox.detail(item)
+          nil
+        rescue StandardError => e
+          e
+        end
+      end
+    end
+
+    def handle(key, next_fetch)
+      case key
+      when "j", "k"
+        step = key == "j" ? 1 : -1
+        if @excluded_mode
+          @excluded_selected = [[@excluded_selected + step, 0].max, [@inbox.excluded_channels.size - 1, 0].max].min
+        else
+          index = @selected ? @selected + step : @resume_index + (step == 1 ? 0 : -1)
+          @selected = [[index, 0].max, [@inbox.items.size - 1, 0].max].min
+          @detail_error = nil
+          start_detail
+        end
+      when "\r", "\n"
+        start_detail
+      when "r"
+        if (item = selected_item)
+          @resume_index = @selected
+          @selected = nil
+          @inbox.mark(item)
+          @message = "Marked read · j/k to select"
+        end
+      when "m"
+        if @excluded_mode
+          if (entry = @inbox.excluded_channels[@excluded_selected])
+            @inbox.include_channel(entry[0])
+            @excluded_selected = [@excluded_selected, [@inbox.excluded_channels.size - 1, 0].max].min
+            @message = "Included #{entry[1]}"
+          end
+        elsif (item = selected_item)
+          @inbox.exclude(item)
+          @selected = [@selected, [@inbox.items.size - 1, 0].max].min
+          @message = "Excluded #{item['channel']} · M to manage"
+          start_detail
+        end
+      when "M"
+        @excluded_mode = !@excluded_mode
+        @excluded_selected = 0 if @excluded_mode
+        @message = @excluded_mode ? "Excluded channels · m to include" : "Inbox"
+        start_detail unless @excluded_mode
+      when "o"
+        if (item = selected_item)
+          @inbox.open(item)
+          @message = "Opened in Slack"
+        end
+      when "R"
+        refresh_async
+        next_fetch = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @inbox.interval
+      end
+      next_fetch
+    rescue Error => e
+      @message = "Error: #{e.message}"
+      next_fetch
+    end
+
+    def draw
+      dimensions = @output.winsize
+      rows = [dimensions[0], 5].max
+      cols = [dimensions[1], 20].max
+      left = cols >= 100 ? cols * 2 / 3 : cols
+      visible = rows - 3
+      first = [(@selected || @resume_index) - visible + 1, 0].max
+      if @excluded_mode
+        first = [@excluded_selected - visible + 1, 0].max
+        excluded = @inbox.excluded_channels
+        screen = visible.times.map do |i|
+          entry = excluded[first + i]
+          if entry
+            prefix = first + i == @excluded_selected ? "> " : "  "
+            Display.clip("#{prefix}#{entry[1]} (#{entry[0]})", cols)
+          else
+            Display.clip(excluded.empty? && i.zero? ? "No excluded channels" : "", cols)
+          end
+        end
+        updated = @inbox.last_checked_at ? "Updated #{@inbox.last_checked_at.strftime('%H:%M')}" : "Checking…"
+        footer = "#{@message} | #{updated} · #{@inbox.excluded_count} messages hidden"
+        frame = [Display.clip("Excluded channels: #{excluded.size} | j/k move m include M inbox R refresh q quit", cols), Display.clip("  CHANNEL", cols), *screen, Display.clip(footer, cols)]
+        @output.write("\e[H\e[2J" + frame.first(rows).join("\r\n"))
+        @output.flush
+        return
+      end
+      list = @inbox.items[first, visible] || []
+      detail = []
+      if (item = selected_item)
+        detail.concat(Display.wrap(Display.line(item), cols - left)) if cols >= 100
+        detail << "Body:"
+        if (value = @inbox.cached_detail(item))
+          detail.concat(Display.wrap(value, cols >= 100 ? cols - left : cols))
+        elsif @detail_error
+          detail << "Body error: #{@detail_error.message}"
+          detail.concat(Display.wrap(item["text"], cols >= 100 ? cols - left : cols))
+        else
+          detail << "Loading body…"
+          detail.concat(Display.wrap(item["text"], cols >= 100 ? cols - left : cols))
+        end
+      end
+      screen = []
+      if cols >= 100
+        visible.times { |i| screen << item_row(list[i], first + i, left - 1) + "│" + Display.clip(detail[i], cols - left) }
+      else
+        list_rows = selected_item ? [visible / 2, 1].max : visible
+        list_rows.times { |i| screen << item_row(list[i], first + i, cols) }
+        (visible - list_rows).times { |i| screen << Display.clip(detail[i], cols) }
+      end
+      updated = @inbox.last_checked_at ? "Updated #{@inbox.last_checked_at.strftime('%H:%M')}" : "Checking…"
+      remaining = [(@next_fetch - Process.clock_gettime(Process::CLOCK_MONOTONIC)).ceil, 0].max
+      footer = "#{updated} · next in #{remaining}s"
+      footer = "#{@inbox.warning} | #{footer}" if @inbox.warning
+      footer = "#{@message} | #{footer}" unless @message.empty?
+      title = "Slack inbox: #{@inbox.items.length} unread · #{@inbox.excluded_count} hidden | j/k move Enter body r read m exclude M manage o open R refresh q quit"
+      frame = [Display.clip(title, cols), Display.clip("  TYPE CHANNEL                  FROM               AGE   TEXT", cols), *screen, Display.clip(footer, cols)]
+      @output.write("\e[H\e[2J" + frame.first(rows).join("\r\n"))
+      @output.flush
+    end
+
+    def item_row(item, index, size)
+      return Display.clip(@inbox.items.empty? && index.zero? ? "No local unread messages" : "", size) unless item
+      prefix = index == @selected ? "> " : "  "
+      line = Display.clip(prefix + Display.line(item), size)
+      color = item["kind"] == "dm" ? "\e[1;33m" : "\e[1;36m"
+      color += "\e[7m" if index == @selected
+      "#{color}#{line}\e[0m"
+    end
+  end
+
+  def self.run(argv)
+    json = argv.delete("--json")
+    interval_option = argv.find { |arg| arg.start_with?("--interval=") }
+    days_option = argv.find { |arg| arg.start_with?("--days=") }
+    argv.delete(interval_option)
+    argv.delete(days_option)
+    interval = interval_option ? Integer(interval_option.split("=", 2)[1]) : DEFAULT_INTERVAL
+    days = days_option ? Integer(days_option.split("=", 2)[1]) : 3
+    raise ArgumentError unless (120..300).cover?(interval) && (1..30).cover?(days)
+    raise ArgumentError unless argv.empty? && RUBY_VERSION.match?(/\A(?:[4-9]|3\.(?:[4-9]|[1-9]\d))\./)
+    tui = !json && $stdin.tty? && $stdout.tty?
+    app = AppServer.new
+    inbox = Inbox.new(app: app, seen: Seen.new, osc: tui, interval: interval, days: days)
+    if tui
+      Tui.new(inbox).run
+    else
+      inbox.fetch
+      inbox.items.each { |item| puts JSON.generate(item) }
+    end
+    0
+  rescue ArgumentError
+    warn "Usage: herdr-slack-inbox [--json] [--interval=120..300] [--days=1..30] (Ruby 3.4+ required)"
+    2
+  rescue Error => e
+    warn "herdr-slack-inbox: #{e.message}"
+    1
+  ensure
+    app&.close
+  end
+end
+
+exit HerdrSlackInbox.run(ARGV) if $PROGRAM_NAME == __FILE__

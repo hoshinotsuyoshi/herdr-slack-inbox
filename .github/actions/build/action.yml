@@ -1,0 +1,73 @@
+name: Build herdr-slack-inbox
+description: >-
+  Builds Spinel at .spinel-version (cached) and compiles bin/herdr-slack-inbox with it. On Windows both are
+  built in MSYS2's UCRT64 shell with the packages Spinel's docs/windows.md lists; the program needs
+  no MSYS2 DLL. Run actions/checkout first, after `git config --global core.autocrlf false`.
+outputs:
+  binary:
+    description: Path of the compiled herdr-slack-inbox (herdr-slack-inbox.exe on Windows)
+    value: ${{ steps.out.outputs.binary }}
+runs:
+  using: composite
+  steps:
+    - name: Set up MSYS2
+      if: runner.os == 'Windows'
+      uses: msys2/setup-msys2@v2.33.0
+      with:
+        msystem: UCRT64
+        update: false
+        install: make diffutils curl tar git mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-ruby
+
+    - name: Name the binary
+      id: name
+      shell: bash
+      run: echo "exe=herdr-slack-inbox$([ "$RUNNER_OS" = Windows ] && echo .exe)" >> "$GITHUB_OUTPUT"
+
+    # In the workspace (and .gitignore), so that the cache, bash and MSYS2 all see the same path
+    - name: Cache Spinel
+      id: cache
+      uses: actions/cache@v6.1.0
+      with:
+        path: .spinel
+        key: spinel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.spinel-version') }}
+
+    - name: Build Spinel (Windows)
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      shell: msys2 {0}
+      run: script/build-spinel.sh "$PWD/.spinel"
+
+    - name: Build Spinel
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os != 'Windows'
+      shell: bash
+      run: script/build-spinel.sh "$PWD/.spinel"
+
+    - name: Build herdr-slack-inbox (Windows)
+      if: runner.os == 'Windows'
+      shell: msys2 {0}
+      env:
+        EXE: ${{ steps.name.outputs.exe }}
+      run: |
+        .spinel/bin/spinel --version
+        .spinel/bin/spinel bin/herdr-slack-inbox -o "$EXE"
+        echo "DLLs it needs:"
+        objdump -p "$EXE" | grep 'DLL Name'
+
+    - name: Build herdr-slack-inbox
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        EXE: ${{ steps.name.outputs.exe }}
+      run: |
+        .spinel/bin/spinel --version
+        .spinel/bin/spinel bin/herdr-slack-inbox -o "$EXE"
+        if [ "$RUNNER_OS" = macOS ]; then otool -L "$EXE"; else
+          ldd "$EXE"
+          echo "Newest glibc symbol version needed:"
+          objdump -T "$EXE" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+        fi
+
+    - id: out
+      shell: bash
+      env:
+        EXE: ${{ steps.name.outputs.exe }}
+      run: echo "binary=$GITHUB_WORKSPACE/$EXE" >> "$GITHUB_OUTPUT"

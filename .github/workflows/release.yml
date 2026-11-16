@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-22.04, target: linux-x86_64 }
+          - { os: ubuntu-22.04-arm, target: linux-arm64 }
+          - { os: macos-15, target: darwin-arm64 }
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/build
+        id: build
+      - uses: ruby/setup-ruby@v1.338.0
+        with:
+          ruby-version: "3.4"
+      - name: Test compiled binary
+        env:
+          INBOX_BIN: ${{ steps.build.outputs.binary }}
+        run: ruby -w test/inbox_test.rb
+      - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          BIN: ${{ steps.build.outputs.binary }}
+        run: |
+          name="herdr-slack-inbox-$TAG-$TARGET"
+          mkdir "$RUNNER_TEMP/$name"
+          cp "$BIN" LICENSE THIRD_PARTY_NOTICES "$RUNNER_TEMP/$name/"
+          tar -C "$RUNNER_TEMP" -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: herdr-slack-inbox-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum herdr-slack-inbox-*.tar.gz > SHA256SUMS
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag herdr-slack-inbox-*.tar.gz SHA256SUMS

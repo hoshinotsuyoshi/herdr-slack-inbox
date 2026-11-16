@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        ruby: ["3.4", "4.0"]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@v1.338.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - run: ruby -wc bin/herdr-slack-inbox && ruby -wc test/inbox_test.rb
+      - run: ruby -w test/inbox_test.rb
+
+  binary:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/build
+        id: build
+      - uses: ruby/setup-ruby@v1.338.0
+        with:
+          ruby-version: "3.4"
+      - name: Test compiled binary
+        env:
+          INBOX_BIN: ${{ steps.build.outputs.binary }}
+        run: ruby -w test/inbox_test.rb

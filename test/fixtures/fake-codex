@@ -1,0 +1,33 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+STDOUT.sync = true
+
+abort "expected app-server" unless ARGV == ["app-server"]
+File.open(ENV.fetch("FAKE_CODEX_LOG"), "a") do |log|
+  STDIN.each_line do |line|
+    request = JSON.parse(line)
+    next unless request["id"]
+    method = request["method"]
+    log.puts(JSON.generate({"method" => method, "tool" => request.dig("params", "tool")}))
+    result = case method
+             when "initialize" then {"serverInfo" => {"name" => "fake"}}
+             when "thread/start" then {"thread" => {"id" => "fake-thread"}}
+             when "account/rateLimits/read" then {"rateLimits" => {"individualLimit" => {"used" => 12.5}}}
+             when "mcpServer/tool/call"
+               tool = request.dig("params", "tool")
+               text = case tool
+                      when "slack.slack_read_user_profile" then "User ID: UFAKE12345\nDisplay Name: Example User\n"
+                      when "slack.slack_search_public_and_private"
+                        filter = request.dig("params", "arguments", "filters")
+                        File.read(File.join(__dir__, filter == "is:dm" ? "dm.json" : "mention.json"))
+                      when "slack.slack_read_thread" then "Thread:\nExample message body"
+                      else abort "forbidden tool: #{tool}"
+                      end
+               {"content" => [{"type" => "text", "text" => tool.include?("search") ? text : JSON.generate({"result" => text})}], "isError" => false}
+             else abort "unexpected method: #{method}"
+             end
+    STDOUT.puts(JSON.generate({"id" => request["id"], "result" => result}))
+  end
+end
