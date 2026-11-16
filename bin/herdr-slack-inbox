@@ -16,6 +16,9 @@ module HerdrSlackInbox
   class Error < StandardError; end
   class AuthError < Error; end
   class ParseError < Error; end
+  # The app-server is alive but its connection to the Slack plugin is gone (sleep, network change).
+  # It does not come back by itself, so the app-server is started again.
+  class TransportError < Error; end
 
   class AppServer
     attr_reader :calls
@@ -59,11 +62,16 @@ module HerdrSlackInbox
       text.match?(/auth|login|connect|install|token|permission|not.connected|unauthorized|401|403/i) ? AuthError.new(text) : Error.new(text)
     end
 
+    def rpc_error(error)
+      text = error.is_a?(Hash) ? error["message"].to_s : error.to_s
+      text.match?(/transport/i) ? TransportError.new(text) : classify(text)
+    end
+
     def twice
       attempts = 0
       begin
         yield
-      rescue EOFError, Errno::EPIPE, IOError, Timeout::Error
+      rescue EOFError, Errno::EPIPE, IOError, Timeout::Error, TransportError
         attempts += 1
         stop
         retry if attempts < 2
@@ -115,7 +123,7 @@ module HerdrSlackInbox
         raise EOFError unless line
         message = JSON.parse(line)
         next unless message["id"] == id
-        raise classify(message["error"].to_s) if message["error"]
+        raise rpc_error(message["error"]) if message["error"]
         return message.fetch("result")
       end
     rescue JSON::ParserError => e

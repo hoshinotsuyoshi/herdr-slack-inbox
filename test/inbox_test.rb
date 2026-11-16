@@ -235,4 +235,15 @@ class InboxTest < Minitest::Test
     assert_equal expected, name
     assert_match %r{\Ahttps://[^/]+\.slack\.com/archives/}, url.strip
   end
+
+  # A dropped connection to the Slack plugin comes back only with a new app-server
+  def test_transport_error_restarts_the_app_server
+    once = File.join(@tmp, "transport-once")
+    out, err, status = Open3.capture3(env.merge("FAKE_CODEX_TRANSPORT_ONCE" => once), BIN, "--json")
+    assert status.success?, err
+    assert File.exist?(once), "the fake did not fail once"
+    assert_equal 3, out.lines.length
+    calls = File.readlines(@log).map { |line| JSON.parse(line) }
+    assert_equal 2, calls.count { |call| call["method"] == "initialize" }
+  end
 end

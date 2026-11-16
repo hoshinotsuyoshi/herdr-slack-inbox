@@ -16,6 +16,13 @@ File.open(ENV.fetch("FAKE_CODEX_LOG"), "a") do |log|
              when "thread/start" then {"thread" => {"id" => "fake-thread"}}
              when "account/rateLimits/read" then {"rateLimits" => {"individualLimit" => {"used" => 12.5}}}
              when "mcpServer/tool/call"
+               # FAKE_CODEX_TRANSPORT_ONCE=<file>: the first tool call fails like a dropped connection
+               once = ENV["FAKE_CODEX_TRANSPORT_ONCE"]
+               if once && !File.exist?(once)
+                 File.write(once, "")
+                 STDOUT.puts(JSON.generate({"id" => request["id"], "error" => {"code" => -32603, "message" => "tool call failed: Transport send error: Transport [codex_rmcp] closed"}}))
+                 next
+               end
                tool = request.dig("params", "tool")
                text = case tool
                       when "slack.slack_read_user_profile" then "User ID: UFAKE12345\nDisplay Name: Example User\n"
