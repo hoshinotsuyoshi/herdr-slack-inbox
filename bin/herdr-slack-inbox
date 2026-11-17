@@ -281,6 +281,8 @@ module HerdrSlackInbox
       @sources.each do |kind, source|
         args = {filters: kind == "dm" ? "is:dm" : "<@#{@uid}>", keywords: [], natural_language_query: "", after: source[:after].to_s, sort: "timestamp", sort_dir: "desc", limit: 20, response_format: "detailed", include_context: false, content_types: "messages"}
         args[:cursor] = source[:cursor] if source[:cursor]
+        # Mentions only from channels you are in; HERDR_SLACK_INBOX_ALL_CHANNELS=1 also shows public channels you are not in
+        args[:only_my_channels] = true if kind == "mention" && ENV["HERDR_SLACK_INBOX_ALL_CHANNELS"] != "1"
         search_result = Parse.search(@app.tool("slack_search_public_and_private", args), kind: kind)
         page = search_result[0]
         cursor = search_result[1]

@@ -246,4 +246,23 @@ class InboxTest < Minitest::Test
     calls = File.readlines(@log).map { |line| JSON.parse(line) }
     assert_equal 2, calls.count { |call| call["method"] == "initialize" }
   end
+
+  def search_arguments(extra_env = {})
+    _out, err, status = Open3.capture3(env.merge(extra_env), BIN, "--json")
+    assert status.success?, err
+    File.readlines(@log).map { |line| JSON.parse(line) }
+      .select { |call| call["tool"] == "slack.slack_search_public_and_private" }
+      .to_h { |call| [call.dig("arguments", "filters") == "is:dm" ? "dm" : "mention", call["arguments"]] }
+  end
+
+  def test_mentions_come_only_from_channels_you_are_in
+    args = search_arguments
+    assert_equal true, args["mention"]["only_my_channels"]
+    refute args["dm"].key?("only_my_channels")
+  end
+
+  def test_all_channels_setting_includes_channels_you_are_not_in
+    args = search_arguments("HERDR_SLACK_INBOX_ALL_CHANNELS" => "1")
+    refute args["mention"].key?("only_my_channels")
+  end
 end

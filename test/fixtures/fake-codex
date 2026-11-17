@@ -10,7 +10,7 @@ File.open(ENV.fetch("FAKE_CODEX_LOG"), "a") do |log|
     request = JSON.parse(line)
     next unless request["id"]
     method = request["method"]
-    log.puts(JSON.generate({"method" => method, "tool" => request.dig("params", "tool")}))
+    log.puts(JSON.generate({"method" => method, "tool" => request.dig("params", "tool"), "arguments" => request.dig("params", "arguments")}))
     result = case method
              when "initialize" then {"serverInfo" => {"name" => "fake"}}
              when "thread/start" then {"thread" => {"id" => "fake-thread"}}
