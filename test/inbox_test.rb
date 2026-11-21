@@ -236,6 +236,27 @@ class InboxTest < Minitest::Test
     assert_match %r{\Ahttps://[^/]+\.slack\.com/archives/}, url.strip
   end
 
+  # Runs the TUI in a pseudo terminal and presses j: the selected row's thread must be read and shown.
+  # Catches `!@detail_thread`, which Spinel compiles to a constant false
+  def test_selected_row_reads_its_thread
+    PTY.spawn(env, BIN) do |reader, writer, pid|
+      # Wide enough that the body line is not clipped
+      reader.winsize = [30, 140]
+      screen = +""
+      drain = Thread.new { loop { screen << reader.readpartial(4096) } rescue nil }
+      deadline = Time.now + 15
+      sleep 0.1 until screen.include?("Updated") || Time.now > deadline
+      writer.write("j")
+      sleep 0.1 until screen.include?("Example message body") || Time.now > deadline
+      writer.write("q")
+      Process.wait(pid)
+      drain.kill
+      assert_includes screen, "Example message body"
+    end
+
+    assert_includes File.read(@log), "slack.slack_read_thread"
+  end
+
   # A dropped connection to the Slack plugin comes back only with a new app-server
   def test_transport_error_restarts_the_app_server
     once = File.join(@tmp, "transport-once")

@@ -62,6 +62,8 @@ INBOX_BIN=./herdr-slack-inbox ruby -w test/inbox_test.rb
 
 Tests use a fake `codex app-server` and invented Slack content; they never call Slack. CI tests Ruby and the Spinel binary. `.spinel-version` pins the compiler, and `script/build-spinel.sh` builds it. Release tags starting with `v` build Linux and macOS archives. GitHub Actions dependencies are recorded in `.github/workflows/actions.lock`.
 
+Write `@thread.nil?`, not `!@thread`, for an instance variable that holds a Thread or nil. Spinel compiles `!@thread` to a constant false, so the code works in Ruby and breaks in the binary.
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Binary dependencies are listed in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

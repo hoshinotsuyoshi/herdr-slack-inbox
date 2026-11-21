@@ -520,7 +520,7 @@ module HerdrSlackInbox
 
     def start_detail
       item = selected_item
-      return unless item && !@inbox.cached_detail(item) && !@detail_thread
+      return unless item && !@inbox.cached_detail(item) && @detail_thread.nil?
       @detail_item = item
       @detail_error = nil
       @detail_thread = Thread.new do
